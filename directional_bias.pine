@@ -1,0 +1,189 @@
+//@version=5
+indicator("Directional Bias — Up / Down / Neutral", overlay=true, max_labels_count=500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+rsiLen        = input.int(14,  "RSI Length",          group="RSI")
+rsiOB         = input.int(70,  "RSI Overbought",      group="RSI")
+rsiOS         = input.int(30,  "RSI Oversold",        group="RSI")
+
+fastLen       = input.int(12,  "MACD Fast",           group="MACD")
+slowLen       = input.int(26,  "MACD Slow",           group="MACD")
+signalLen     = input.int(9,   "MACD Signal",         group="MACD")
+
+emaFast       = input.int(20,  "EMA Fast",            group="EMA Trend")
+emaSlow       = input.int(50,  "EMA Slow",            group="EMA Trend")
+ema200Len     = input.int(200, "EMA 200 (Long Trend)",group="EMA Trend")
+
+bbLen         = input.int(20,  "BB Length",           group="Bollinger Bands")
+bbMult        = input.float(2.0,"BB StdDev",          group="Bollinger Bands")
+
+volMaLen      = input.int(20,  "Volume MA Length",    group="Volume")
+
+// score threshold: minimum net score to call bullish/bearish (else neutral)
+scoreThresh   = input.int(2,   "Score Threshold (1-5)", minval=1, maxval=5,
+                 tooltip="How many indicators must agree before printing a signal.",
+                 group="Signal")
+
+showLabels    = input.bool(true,  "Show Bar Labels",  group="Display")
+showTable     = input.bool(true,  "Show Score Table", group="Display")
+
+// ─── INDICATOR CALCULATIONS ───────────────────────────────────────────────────
+
+// RSI
+rsiVal = ta.rsi(close, rsiLen)
+
+// MACD
+[macdLine, signalLine, histLine] = ta.macd(close, fastLen, slowLen, signalLen)
+
+// EMA trend
+ema20  = ta.ema(close, emaFast)
+ema50  = ta.ema(close, emaSlow)
+ema200 = ta.ema(close, ema200Len)
+
+// Bollinger Bands
+bbBasis = ta.sma(close, bbLen)
+bbDev   = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbPos   = (close - bbLower) / (bbUpper - bbLower)   // 0 = at lower, 1 = at upper
+
+// Volume surge
+volMa      = ta.sma(volume, volMaLen)
+volSurge   = volume > volMa * 1.5
+
+// ─── SCORING (+1 bull / -1 bear / 0 neutral) ──────────────────────────────────
+//  5 independent dimensions, each contributes ±1
+
+// 1. RSI momentum
+rsiScore = rsiVal < rsiOS ? 1 : rsiVal > rsiOB ? -1 : rsiVal > 50 ? 1 : rsiVal < 50 ? -1 : 0
+
+// 2. MACD crossover / histogram direction
+macdScore = macdLine > signalLine and histLine > 0 ? 1 :
+            macdLine < signalLine and histLine < 0 ? -1 : 0
+
+// 3. EMA 20/50 cross (short-term trend)
+emaScore = ema20 > ema50 ? 1 : ema20 < ema50 ? -1 : 0
+
+// 4. Price vs EMA 200 (long-term trend filter)
+ema200Score = close > ema200 ? 1 : close < ema200 ? -1 : 0
+
+// 5. Bollinger Band position (mean-reversion + breakout)
+//    below lower → bullish pressure; above upper → bearish pressure
+//    inside band: upper half → mild bull, lower half → mild bear
+bbScore = close < bbLower ? 1 : close > bbUpper ? -1 :
+          bbPos >= 0.5    ? 1 : -1
+
+// Net score (range -5 to +5)
+netScore = rsiScore + macdScore + emaScore + ema200Score + bbScore
+
+// Volume confirmation: if a surge backs the direction, boost by 1 (capped at ±5)
+volBoost = volSurge and netScore > 0 ? 1 : volSurge and netScore < 0 ? -1 : 0
+finalScore = math.max(-5, math.min(5, netScore + volBoost))
+
+// ─── SIGNAL ───────────────────────────────────────────────────────────────────
+isBull    = finalScore >=  scoreThresh
+isBear    = finalScore <= -scoreThresh
+isNeutral = not isBull and not isBear
+
+// Detect signal *changes* so we don't spam labels on every bar
+prevBull    = finalScore[1] >=  scoreThresh
+prevBear    = finalScore[1] <= -scoreThresh
+newBull     = isBull    and not prevBull
+newBear     = isBear    and not prevBear
+newNeutral  = isNeutral and (prevBull or prevBear)
+
+// ─── VISUALS ──────────────────────────────────────────────────────────────────
+bullColor   = color.new(#00c853, 0)
+bearColor   = color.new(#d50000, 0)
+neutColor   = color.new(#9e9e9e, 0)
+
+// Background tint (subtle)
+bgCol = isBull ? color.new(bullColor, 92) : isBear ? color.new(bearColor, 92) : na
+bgcolor(bgCol, title="Bias Background")
+
+// EMA plots
+plot(ema20,  "EMA 20",  color=color.new(#2196f3, 0),  linewidth=1)
+plot(ema50,  "EMA 50",  color=color.new(#ff9800, 0),  linewidth=1)
+plot(ema200, "EMA 200", color=color.new(#9c27b0, 20), linewidth=2)
+
+// Labels on signal changes (or every bar if user prefers)
+if showLabels
+    if newBull or (isBull and barstate.islast)
+        label.new(bar_index, low,
+                  "▲ UP\n" + str.tostring(finalScore) + "/5",
+                  style=label.style_label_up,
+                  color=bullColor, textcolor=color.white, size=size.small)
+
+    if newBear or (isBear and barstate.islast)
+        label.new(bar_index, high,
+                  "▼ DOWN\n" + str.tostring(finalScore) + "/5",
+                  style=label.style_label_down,
+                  color=bearColor, textcolor=color.white, size=size.small)
+
+    if newNeutral or (isNeutral and barstate.islast)
+        label.new(bar_index, high,
+                  "● HOLD\n" + str.tostring(finalScore) + "/5",
+                  style=label.style_label_down,
+                  color=neutColor, textcolor=color.white, size=size.small)
+
+// ─── SCORE TABLE ──────────────────────────────────────────────────────────────
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 3, 8,
+                            border_width=1,
+                            border_color=color.new(color.gray, 60),
+                            frame_color=color.new(color.gray, 60),
+                            frame_width=1)
+
+    hdrBg  = color.new(#37474f, 0)
+    hdrTxt = color.white
+
+    cellColor(score) =>
+        score > 0 ? bullColor : score < 0 ? bearColor : neutColor
+
+    scoreTxt(score) =>
+        score > 0 ? "▲ +" + str.tostring(score) :
+        score < 0 ? "▼ "  + str.tostring(score) : "● 0"
+
+    // Header
+    table.cell(t, 0, 0, "Indicator",  text_color=hdrTxt, bgcolor=hdrBg, text_size=size.small)
+    table.cell(t, 1, 0, "Score",      text_color=hdrTxt, bgcolor=hdrBg, text_size=size.small)
+    table.cell(t, 2, 0, "Value",      text_color=hdrTxt, bgcolor=hdrBg, text_size=size.small)
+
+    // Rows
+    table.cell(t, 0, 1, "RSI",       text_color=color.white, bgcolor=cellColor(rsiScore),    text_size=size.small)
+    table.cell(t, 1, 1, scoreTxt(rsiScore),     text_color=color.white, bgcolor=cellColor(rsiScore),    text_size=size.small)
+    table.cell(t, 2, 1, str.tostring(math.round(rsiVal, 1)), text_color=color.white, bgcolor=cellColor(rsiScore), text_size=size.small)
+
+    table.cell(t, 0, 2, "MACD",      text_color=color.white, bgcolor=cellColor(macdScore),   text_size=size.small)
+    table.cell(t, 1, 2, scoreTxt(macdScore),    text_color=color.white, bgcolor=cellColor(macdScore),   text_size=size.small)
+    table.cell(t, 2, 2, str.tostring(math.round(histLine, 3)), text_color=color.white, bgcolor=cellColor(macdScore), text_size=size.small)
+
+    table.cell(t, 0, 3, "EMA 20/50", text_color=color.white, bgcolor=cellColor(emaScore),    text_size=size.small)
+    table.cell(t, 1, 3, scoreTxt(emaScore),     text_color=color.white, bgcolor=cellColor(emaScore),    text_size=size.small)
+    table.cell(t, 2, 3, ema20 > ema50 ? "20 > 50" : "20 < 50", text_color=color.white, bgcolor=cellColor(emaScore), text_size=size.small)
+
+    table.cell(t, 0, 4, "EMA 200",   text_color=color.white, bgcolor=cellColor(ema200Score), text_size=size.small)
+    table.cell(t, 1, 4, scoreTxt(ema200Score),  text_color=color.white, bgcolor=cellColor(ema200Score), text_size=size.small)
+    table.cell(t, 2, 4, close > ema200 ? "Above" : "Below", text_color=color.white, bgcolor=cellColor(ema200Score), text_size=size.small)
+
+    table.cell(t, 0, 5, "Bol. Bands",text_color=color.white, bgcolor=cellColor(bbScore),     text_size=size.small)
+    table.cell(t, 1, 5, scoreTxt(bbScore),      text_color=color.white, bgcolor=cellColor(bbScore),     text_size=size.small)
+    table.cell(t, 2, 5, str.tostring(math.round(bbPos * 100, 1)) + "%", text_color=color.white, bgcolor=cellColor(bbScore), text_size=size.small)
+
+    table.cell(t, 0, 6, "Vol Boost", text_color=color.white, bgcolor=cellColor(volBoost),    text_size=size.small)
+    table.cell(t, 1, 6, scoreTxt(volBoost),     text_color=color.white, bgcolor=cellColor(volBoost),    text_size=size.small)
+    table.cell(t, 2, 6, volSurge ? "Surge" : "Normal",       text_color=color.white, bgcolor=cellColor(volBoost),    text_size=size.small)
+
+    // Final verdict
+    verdictBg  = isBull ? bullColor : isBear ? bearColor : neutColor
+    verdictTxt = isBull ? "▲  UP  (" + str.tostring(finalScore) + "/5)" :
+                 isBear ? "▼  DOWN  (" + str.tostring(finalScore) + "/5)" :
+                          "●  NEUTRAL  (" + str.tostring(finalScore) + "/5)"
+    table.cell(t, 0, 7, "VERDICT",   text_color=color.white, bgcolor=verdictBg, text_size=size.small)
+    table.cell(t, 1, 7, verdictTxt,  text_color=color.white, bgcolor=verdictBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 2, 7, "",          text_color=color.white, bgcolor=verdictBg, text_size=size.small)
+
+// ─── ALERTS ───────────────────────────────────────────────────────────────────
+alertcondition(newBull,    "Bias → BULLISH",  "Directional Bias turned BULLISH (score: {{finalScore}})")
+alertcondition(newBear,    "Bias → BEARISH",  "Directional Bias turned BEARISH (score: {{finalScore}})")
+alertcondition(newNeutral, "Bias → NEUTRAL",  "Directional Bias turned NEUTRAL")

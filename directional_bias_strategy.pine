@@ -1,0 +1,228 @@
+//@version=5
+strategy("Directional Bias Strategy", overlay=true,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10,
+         initial_capital=10000,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         slippage=2)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+// Signal
+rsiLen       = input.int(14,   "RSI Length",            group="Signal")
+rsiOB        = input.int(70,   "RSI Overbought",        group="Signal")
+rsiOS        = input.int(30,   "RSI Oversold",          group="Signal")
+fastLen      = input.int(12,   "MACD Fast",             group="Signal")
+slowLen      = input.int(26,   "MACD Slow",             group="Signal")
+signalLen    = input.int(9,    "MACD Signal",           group="Signal")
+emaFast      = input.int(20,   "EMA Fast",              group="Signal")
+emaSlow      = input.int(50,   "EMA Slow",              group="Signal")
+ema200Len    = input.int(200,  "EMA 200",               group="Signal")
+bbLen        = input.int(20,   "BB Length",             group="Signal")
+bbMult       = input.float(2.0,"BB StdDev",             group="Signal")
+volMaLen     = input.int(20,   "Volume MA Length",      group="Signal")
+scoreThresh  = input.int(2,    "Score Threshold (1-5)", group="Signal", minval=1, maxval=5)
+
+// Trade direction
+tradeDir     = input.string("Both", "Trade Direction",
+               options=["Both", "Long Only", "Short Only"],  group="Strategy")
+
+// Risk management mode
+slMode       = input.string("ATR", "Stop-Loss Mode",
+               options=["ATR", "Percent"],                    group="Risk Management")
+slAtrMult    = input.float(2.0,  "SL — ATR Multiplier",      group="Risk Management", step=0.1)
+slPct        = input.float(2.0,  "SL — % from Entry",        group="Risk Management", step=0.1)
+atrLen       = input.int(14,     "ATR Length",               group="Risk Management")
+
+tpMode       = input.string("RR Ratio", "Take-Profit Mode",
+               options=["RR Ratio", "Percent", "None"],       group="Risk Management")
+tpRR         = input.float(2.0,  "TP — Risk:Reward Ratio",   group="Risk Management", step=0.1)
+tpPct        = input.float(4.0,  "TP — % from Entry",        group="Risk Management", step=0.1)
+
+// Exit when signal flips
+exitOnFlip   = input.bool(true, "Exit when bias flips / goes neutral", group="Risk Management")
+
+// Position sizing
+qtyPct       = input.float(10.0, "Equity per trade (%)",     group="Position Sizing",  step=1.0)
+
+// Display
+showEMAs     = input.bool(true,  "Show EMAs",                group="Display")
+showTable    = input.bool(true,  "Show Score Table",         group="Display")
+
+// ─── INDICATOR CALCULATIONS ───────────────────────────────────────────────────
+rsiVal = ta.rsi(close, rsiLen)
+[macdLine, signalLine, histLine] = ta.macd(close, fastLen, slowLen, signalLen)
+
+ema20  = ta.ema(close, emaFast)
+ema50  = ta.ema(close, emaSlow)
+ema200 = ta.ema(close, ema200Len)
+
+bbBasis = ta.sma(close, bbLen)
+bbDev   = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbPos   = (close - bbLower) / (bbUpper - bbLower)
+
+volMa    = ta.sma(volume, volMaLen)
+volSurge = volume > volMa * 1.5
+
+atr = ta.atr(atrLen)
+
+// ─── SCORING ──────────────────────────────────────────────────────────────────
+rsiScore   = rsiVal < rsiOS ? 1 : rsiVal > rsiOB ? -1 : rsiVal > 50 ? 1 : -1
+macdScore  = macdLine > signalLine and histLine > 0 ? 1 :
+             macdLine < signalLine and histLine < 0 ? -1 : 0
+emaScore   = ema20 > ema50 ? 1 : ema20 < ema50 ? -1 : 0
+ema200Score= close > ema200 ? 1 : close < ema200 ? -1 : 0
+bbScore    = close < bbLower ? 1 : close > bbUpper ? -1 : bbPos >= 0.5 ? 1 : -1
+
+netScore   = rsiScore + macdScore + emaScore + ema200Score + bbScore
+volBoost   = volSurge and netScore > 0 ? 1 : volSurge and netScore < 0 ? -1 : 0
+finalScore = math.max(-5, math.min(5, netScore + volBoost))
+
+isBull    = finalScore >=  scoreThresh
+isBear    = finalScore <= -scoreThresh
+isNeutral = not isBull and not isBear
+
+prevBull  = finalScore[1] >=  scoreThresh
+prevBear  = finalScore[1] <= -scoreThresh
+
+newBull   = isBull and not prevBull
+newBear   = isBear and not prevBear
+
+// ─── RISK LEVELS ──────────────────────────────────────────────────────────────
+// Calculated fresh at each entry bar; stored via strategy vars after fill
+longSL  = slMode == "ATR" ? close - atr * slAtrMult : close * (1 - slPct / 100)
+shortSL = slMode == "ATR" ? close + atr * slAtrMult : close * (1 + slPct / 100)
+
+longRisk  = close - longSL
+shortRisk = shortSL - close
+
+longTP  = tpMode == "RR Ratio" ? close + longRisk  * tpRR :
+          tpMode == "Percent"  ? close * (1 + tpPct / 100) : na
+shortTP = tpMode == "RR Ratio" ? close - shortRisk * tpRR :
+          tpMode == "Percent"  ? close * (1 - tpPct / 100) : na
+
+// ─── STRATEGY LOGIC ───────────────────────────────────────────────────────────
+canLong  = tradeDir != "Short Only"
+canShort = tradeDir != "Long Only"
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+flat    = strategy.position_size == 0
+
+// Entry
+if newBull and canLong and (flat or inShort)
+    if inShort
+        strategy.close("Short", comment="▲ Flip")
+    strategy.entry("Long", strategy.long, qty_percent=qtyPct, comment="▲ Enter")
+    strategy.exit("Long SL/TP", from_entry="Long",
+                  stop=longSL,
+                  limit=tpMode != "None" ? longTP : na)
+
+if newBear and canShort and (flat or inLong)
+    if inLong
+        strategy.close("Long", comment="▼ Flip")
+    strategy.entry("Short", strategy.short, qty_percent=qtyPct, comment="▼ Enter")
+    strategy.exit("Short SL/TP", from_entry="Short",
+                  stop=shortSL,
+                  limit=tpMode != "None" ? shortTP : na)
+
+// Exit on neutral flip
+if exitOnFlip and isNeutral
+    if inLong
+        strategy.close("Long",  comment="● Neutral")
+    if inShort
+        strategy.close("Short", comment="● Neutral")
+
+// ─── VISUALS ──────────────────────────────────────────────────────────────────
+bullColor = color.new(#00c853, 0)
+bearColor = color.new(#d50000, 0)
+neutColor = color.new(#9e9e9e, 0)
+
+bgCol = isBull ? color.new(bullColor, 92) : isBear ? color.new(bearColor, 92) : na
+bgcolor(bgCol, title="Bias Background")
+
+plot(showEMAs ? ema20  : na, "EMA 20",  color=color.new(#2196f3,  0), linewidth=1)
+plot(showEMAs ? ema50  : na, "EMA 50",  color=color.new(#ff9800,  0), linewidth=1)
+plot(showEMAs ? ema200 : na, "EMA 200", color=color.new(#9c27b0, 20), linewidth=2)
+
+// SL / TP lines for open position
+slLine = inLong  ? longSL  : inShort ? shortSL : na
+tpLine = inLong  ? longTP  : inShort ? shortTP : na
+plot(slLine, "Stop-Loss",   color=color.new(bearColor, 20), style=plot.style_linebr, linewidth=2)
+plot(tpLine, "Take-Profit", color=color.new(bullColor, 20), style=plot.style_linebr, linewidth=2)
+
+// Entry arrows
+plotshape(newBull and canLong,  title="Long Entry",  style=shape.triangleup,
+          location=location.belowbar, color=bullColor, size=size.small)
+plotshape(newBear and canShort, title="Short Entry", style=shape.triangledown,
+          location=location.abovebar, color=bearColor, size=size.small)
+
+// ─── SCORE TABLE ──────────────────────────────────────────────────────────────
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 3, 9,
+                            border_width=1,
+                            border_color=color.new(color.gray, 60),
+                            frame_color=color.new(color.gray, 60),
+                            frame_width=1)
+
+    hdrBg  = color.new(#37474f, 0)
+    hdrTxt = color.white
+
+    cellColor(score) =>
+        score > 0 ? bullColor : score < 0 ? bearColor : neutColor
+
+    scoreTxt(score) =>
+        score > 0 ? "▲ +" + str.tostring(score) :
+        score < 0 ? "▼ "  + str.tostring(score) : "● 0"
+
+    table.cell(t, 0, 0, "Indicator",   text_color=hdrTxt, bgcolor=hdrBg, text_size=size.small)
+    table.cell(t, 1, 0, "Score",       text_color=hdrTxt, bgcolor=hdrBg, text_size=size.small)
+    table.cell(t, 2, 0, "Value",       text_color=hdrTxt, bgcolor=hdrBg, text_size=size.small)
+
+    table.cell(t, 0, 1, "RSI",         text_color=color.white, bgcolor=cellColor(rsiScore),     text_size=size.small)
+    table.cell(t, 1, 1, scoreTxt(rsiScore),      text_color=color.white, bgcolor=cellColor(rsiScore),     text_size=size.small)
+    table.cell(t, 2, 1, str.tostring(math.round(rsiVal, 1)),   text_color=color.white, bgcolor=cellColor(rsiScore),     text_size=size.small)
+
+    table.cell(t, 0, 2, "MACD",        text_color=color.white, bgcolor=cellColor(macdScore),    text_size=size.small)
+    table.cell(t, 1, 2, scoreTxt(macdScore),     text_color=color.white, bgcolor=cellColor(macdScore),    text_size=size.small)
+    table.cell(t, 2, 2, str.tostring(math.round(histLine, 3)), text_color=color.white, bgcolor=cellColor(macdScore),    text_size=size.small)
+
+    table.cell(t, 0, 3, "EMA 20/50",   text_color=color.white, bgcolor=cellColor(emaScore),     text_size=size.small)
+    table.cell(t, 1, 3, scoreTxt(emaScore),      text_color=color.white, bgcolor=cellColor(emaScore),     text_size=size.small)
+    table.cell(t, 2, 3, ema20 > ema50 ? "20 > 50" : "20 < 50", text_color=color.white, bgcolor=cellColor(emaScore),   text_size=size.small)
+
+    table.cell(t, 0, 4, "EMA 200",     text_color=color.white, bgcolor=cellColor(ema200Score),  text_size=size.small)
+    table.cell(t, 1, 4, scoreTxt(ema200Score),   text_color=color.white, bgcolor=cellColor(ema200Score),  text_size=size.small)
+    table.cell(t, 2, 4, close > ema200 ? "Above" : "Below",    text_color=color.white, bgcolor=cellColor(ema200Score), text_size=size.small)
+
+    table.cell(t, 0, 5, "Bol. Bands",  text_color=color.white, bgcolor=cellColor(bbScore),      text_size=size.small)
+    table.cell(t, 1, 5, scoreTxt(bbScore),       text_color=color.white, bgcolor=cellColor(bbScore),      text_size=size.small)
+    table.cell(t, 2, 5, str.tostring(math.round(bbPos * 100, 1)) + "%", text_color=color.white, bgcolor=cellColor(bbScore), text_size=size.small)
+
+    table.cell(t, 0, 6, "Vol Boost",   text_color=color.white, bgcolor=cellColor(volBoost),     text_size=size.small)
+    table.cell(t, 1, 6, scoreTxt(volBoost),      text_color=color.white, bgcolor=cellColor(volBoost),     text_size=size.small)
+    table.cell(t, 2, 6, volSurge ? "Surge" : "Normal",         text_color=color.white, bgcolor=cellColor(volBoost),    text_size=size.small)
+
+    positionTxt = inLong  ? "LONG  (" + str.tostring(math.round(strategy.position_avg_price, 2)) + ")" :
+                  inShort ? "SHORT (" + str.tostring(math.round(strategy.position_avg_price, 2)) + ")" :
+                  "Flat"
+    positionBg  = inLong ? bullColor : inShort ? bearColor : neutColor
+
+    verdictBg  = isBull ? bullColor : isBear ? bearColor : neutColor
+    verdictTxt = isBull ? "▲  UP  (" + str.tostring(finalScore) + "/5)" :
+                 isBear ? "▼  DOWN  (" + str.tostring(finalScore) + "/5)" :
+                          "●  NEUTRAL  (" + str.tostring(finalScore) + "/5)"
+
+    table.cell(t, 0, 7, "VERDICT",     text_color=color.white, bgcolor=verdictBg,   text_size=size.small)
+    table.cell(t, 1, 7, verdictTxt,    text_color=color.white, bgcolor=verdictBg,   text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 2, 7, "",            text_color=color.white, bgcolor=verdictBg,   text_size=size.small)
+
+    table.cell(t, 0, 8, "POSITION",    text_color=color.white, bgcolor=positionBg,  text_size=size.small)
+    table.cell(t, 1, 8, positionTxt,   text_color=color.white, bgcolor=positionBg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 2, 8, "",            text_color=color.white, bgcolor=positionBg,  text_size=size.small)
+
+// ─── ALERTS ───────────────────────────────────────────────────────────────────
+alertcondition(newBull and canLong,  "Long Entry",  "Directional Bias: LONG entry signal")
+alertcondition(newBear and canShort, "Short Entry", "Directional Bias: SHORT entry signal")

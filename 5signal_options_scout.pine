@@ -2,9 +2,19 @@
 indicator("5-Signal Options Scout", overlay=true, max_bars_back=500)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  5-SIGNAL OPTIONS SCOUT
-//  Combines: EMA Trend · RSI · MACD · Bollinger Bands · Volume · HV Rank (IV proxy)
+//  5-SIGNAL OPTIONS SCOUT  v2
+//  Combines: EMA Trend · RSI · MACD · Bollinger Bands · Volume · HV Rank · ADX
 //  Fires alerts when 3+ signals align. Dashboard table shows live signal status.
+//
+//  Changes from v1:
+//   • Volume is now directional (bull candle / bear candle), no longer added to both scores
+//   • EMA requires price confirmation (close > ema9 for bull, close < ema9 for bear)
+//   • MACD simplified to histogram polarity — previous check was redundant
+//   • HV Rank guarded against divide-by-zero and na on short history
+//   • Iron Condor excluded when BB squeeze is active (contradictory setups)
+//   • ADX filter added (optional) to suppress choppy-market signals
+//   • ATR row added to dashboard for move-size context
+//   • Hidden plots added so alert {{plot_N}} references show correct score / HV Rank
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── INPUTS ───────────────────────────────────────────────────────────────────
@@ -38,18 +48,24 @@ hv_lookback   = input.int(252,  "HV Rank lookback (bars, ~1yr daily)", group=grp
 hv_low_thresh = input.int(30,   "Low HV Rank = buy options (below %)", group=grp6)
 hv_high_thresh= input.int(50,   "High HV Rank = sell premium (above %)", group=grp6)
 
-grp7 = "Alert Settings"
-min_bull      = input.int(3, "Min bull signals to alert (of 5)", minval=1, maxval=5, group=grp7)
-min_bear      = input.int(3, "Min bear signals to alert (of 5)", minval=1, maxval=5, group=grp7)
-show_labels   = input.bool(true, "Show signal labels on chart", group=grp7)
-show_table    = input.bool(true, "Show dashboard table", group=grp7)
+grp7 = "⑦ ADX Trend Filter"
+use_adx       = input.bool(false,"Enable ADX filter (reduces chop signals)", group=grp7)
+adx_len       = input.int(14,   "ADX length",        group=grp7)
+adx_thresh    = input.int(20,   "Min ADX (trend strength required)", group=grp7)
+
+grp8 = "Alert & Display"
+min_bull      = input.int(3, "Min bull signals to alert (of 5)", minval=1, maxval=5, group=grp8)
+min_bear      = input.int(3, "Min bear signals to alert (of 5)", minval=1, maxval=5, group=grp8)
+show_labels   = input.bool(true, "Show signal labels on chart", group=grp8)
+show_table    = input.bool(true, "Show dashboard table", group=grp8)
 
 
 // ─── SIGNAL 1: EMA TREND ──────────────────────────────────────────────────────
+// Requires price to confirm EMA alignment — prevents EMA always contributing 1pt
 ema9          = ta.ema(close, ema_fast)
 ema21         = ta.ema(close, ema_slow)
-sig1_bull     = ema9 > ema21         // bullish: fast above slow
-sig1_bear     = ema9 < ema21         // bearish: fast below slow
+sig1_bull     = ema9 > ema21 and close > ema9
+sig1_bear     = ema9 < ema21 and close < ema9
 sig1_cross_up = ta.crossover(ema9, ema21)
 sig1_cross_dn = ta.crossunder(ema9, ema21)
 
@@ -61,9 +77,10 @@ sig2_bear     = rsi_val > rsi_ob     // overbought = bearish setup
 
 
 // ─── SIGNAL 3: MACD ───────────────────────────────────────────────────────────
+// Histogram polarity is sufficient — checking both hist and line relationship is redundant
 [macd_line, sig_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
-sig3_bull     = macd_line > sig_line and macd_hist > 0   // bullish momentum
-sig3_bear     = macd_line < sig_line and macd_hist < 0   // bearish momentum
+sig3_bull     = macd_hist > 0
+sig3_bear     = macd_hist < 0
 sig3_cross_up = ta.crossover(macd_line, sig_line)
 sig3_cross_dn = ta.crossunder(macd_line, sig_line)
 
@@ -75,66 +92,82 @@ bb_upper      = bb_basis + bb_mult * bb_dev
 bb_lower      = bb_basis - bb_mult * bb_dev
 bb_width      = (bb_upper - bb_lower) / bb_basis
 bb_width_avg  = ta.sma(bb_width, bb_len)
-bb_squeeze    = bb_width < bb_width_avg * bb_sqz_pct   // bands contracting
-sig4_bull     = close <= bb_lower * 1.005 and not bb_squeeze   // at lower band
-sig4_bear     = close >= bb_upper * 0.995 and not bb_squeeze   // at upper band
-sig4_squeeze  = bb_squeeze                                      // big move coming
+bb_squeeze    = bb_width < bb_width_avg * bb_sqz_pct
+sig4_bull     = close <= bb_lower * 1.005 and not bb_squeeze
+sig4_bear     = close >= bb_upper * 0.995 and not bb_squeeze
+sig4_squeeze  = bb_squeeze
 
 
 // ─── SIGNAL 5: VOLUME CONFIRMATION ───────────────────────────────────────────
+// Directional: only counts toward the side matching the candle, not both simultaneously
 vol_avg       = ta.sma(volume, vol_len)
-sig5_confirm  = volume > vol_avg * vol_mult   // above-average volume
-sig5_weak     = volume < vol_avg * 0.75       // below-average = distrust signal
+bull_candle   = close >= open
+bear_candle   = close < open
+sig5_vol_bull = volume > vol_avg * vol_mult and bull_candle
+sig5_vol_bear = volume > vol_avg * vol_mult and bear_candle
+sig5_weak     = volume < vol_avg * 0.75
 
 
 // ─── SIGNAL 6: HV RANK (IV PROXY) ────────────────────────────────────────────
-//  Uses annualised historical volatility percentile as a proxy for IV Rank.
-//  Low HV Rank (<30) = volatility compressed = options cheap = lean BUY.
-//  High HV Rank (>50) = volatility elevated = options expensive = lean SELL.
 log_ret       = math.log(close / close[1])
 hv_val        = ta.stdev(log_ret, hv_period) * math.sqrt(252) * 100
 hv_highest    = ta.highest(hv_val, hv_lookback)
 hv_lowest     = ta.lowest(hv_val,  hv_lookback)
-hv_rank       = (hv_val - hv_lowest) / (hv_highest - hv_lowest) * 100
-hv_low_signal = hv_rank < hv_low_thresh    // options cheap → buy premium
-hv_high_signal= hv_rank > hv_high_thresh   // options expensive → sell premium
+hv_denom      = hv_highest - hv_lowest
+// Guard: default to 50 (neutral) when history is too short or variance is flat
+hv_rank       = na(hv_denom) or hv_denom == 0 ? 50.0 : (hv_val - hv_lowest) / hv_denom * 100
+hv_low_signal = hv_rank < hv_low_thresh
+hv_high_signal= hv_rank > hv_high_thresh
+
+
+// ─── SIGNAL 7: ADX TREND STRENGTH ────────────────────────────────────────────
+[di_plus, di_minus, adx_val] = ta.dmi(adx_len, adx_len)
+adx_trending  = not use_adx or adx_val >= adx_thresh
 
 
 // ─── COMPOSITE SCORING ───────────────────────────────────────────────────────
-//  Each directional signal scores 1 point.
-//  Volume adds 1 if confirming; subtracts credibility if weak (score ×0.8).
+bull_raw = (sig1_bull     ? 1 : 0) + (sig2_bull     ? 1 : 0) +
+           (sig3_bull     ? 1 : 0) + (sig4_bull     ? 1 : 0) +
+           (sig5_vol_bull ? 1 : 0)
 
-bull_raw = (sig1_bull ? 1 : 0) + (sig2_bull ? 1 : 0) + (sig3_bull ? 1 : 0) +
-           (sig4_bull ? 1 : 0) + (sig5_confirm ? 1 : 0)
-
-bear_raw = (sig1_bear ? 1 : 0) + (sig2_bear ? 1 : 0) + (sig3_bear ? 1 : 0) +
-           (sig4_bear ? 1 : 0) + (sig5_confirm ? 1 : 0)
+bear_raw = (sig1_bear     ? 1 : 0) + (sig2_bear     ? 1 : 0) +
+           (sig3_bear     ? 1 : 0) + (sig4_bear     ? 1 : 0) +
+           (sig5_vol_bear ? 1 : 0)
 
 bull_score = sig5_weak ? math.round(bull_raw * 0.8) : bull_raw
 bear_score = sig5_weak ? math.round(bear_raw * 0.8) : bear_raw
 
 
 // ─── STRATEGY SIGNALS ────────────────────────────────────────────────────────
-fire_long_call    = bull_score >= min_bull and hv_low_signal
-fire_long_put     = bear_score >= min_bear and hv_low_signal
-fire_sell_put     = bull_score >= 2 and hv_high_signal     // sell cash-secured put
-fire_sell_call    = bear_score >= 2 and hv_high_signal     // sell covered call
-fire_iron_condor  = hv_high_signal and bull_score < 2 and bear_score < 2
-fire_squeeze      = sig4_squeeze and not hv_high_signal    // straddle/strangle setup
+fire_long_call    = bull_score >= min_bull and hv_low_signal  and adx_trending
+fire_long_put     = bear_score >= min_bear and hv_low_signal  and adx_trending
+fire_sell_put     = bull_score >= 2        and hv_high_signal and adx_trending
+fire_sell_call    = bear_score >= 2        and hv_high_signal and adx_trending
+// Squeeze and condor are mutually exclusive: squeeze expects a big move, condor needs calm
+fire_iron_condor  = hv_high_signal and bull_score < 2 and bear_score < 2 and not sig4_squeeze
+fire_squeeze      = sig4_squeeze and not hv_high_signal
+
+
+// ─── ATR FOR SIZING CONTEXT ───────────────────────────────────────────────────
+atr_val = ta.atr(14)
+atr_pct = atr_val / close * 100
 
 
 // ─── CHART PLOTS ─────────────────────────────────────────────────────────────
+// plot_0..4 — visible lines
 plot(ema9,     "EMA 9",     color=color.new(color.blue, 10),   linewidth=1)
 plot(ema21,    "EMA 21",    color=color.new(color.orange, 10), linewidth=1)
 plot(bb_upper, "BB Upper",  color=color.new(color.gray, 55),   linewidth=1)
 plot(bb_lower, "BB Lower",  color=color.new(color.gray, 55),   linewidth=1)
 plot(bb_basis, "BB Mid",    color=color.new(color.gray, 75),   linewidth=1)
+// plot_5..7 — hidden; referenced by alertcondition {{plot_N}} tokens
+plot(bull_score, "Bull Score", display=display.none)
+plot(bear_score, "Bear Score", display=display.none)
+plot(hv_rank,    "HV Rank",    display=display.none)
 
-// EMA background fill
-ema_bull_bg = ema9 > ema21 ? color.new(color.teal,  92) : na
-ema_bear_bg = ema9 < ema21 ? color.new(color.red,   92) : na
-bgcolor(ema_bull_bg, title="Bull EMA bg")
-bgcolor(ema_bear_bg, title="Bear EMA bg")
+// EMA background: teal when ema9 > ema21, red when below (regardless of price position)
+bgcolor(ema9 > ema21 ? color.new(color.teal, 92) : na, title="Bull EMA bg")
+bgcolor(ema9 < ema21 ? color.new(color.red,  92) : na, title="Bear EMA bg")
 
 // Squeeze highlight
 bgcolor(sig4_squeeze ? color.new(color.yellow, 88) : na, title="BB Squeeze")
@@ -180,8 +213,8 @@ if show_labels
 
 
 // ─── DASHBOARD TABLE ──────────────────────────────────────────────────────────
-var table dash = table.new(position.top_right, 3, 10,
-                            bgcolor    = color.new(color.black, 80),
+var table dash = table.new(position.top_right, 3, 11,
+                            bgcolor      = color.new(color.black, 80),
                             border_color = color.new(color.gray, 50),
                             border_width = 1,
                             frame_color  = color.new(color.gray, 40),
@@ -199,13 +232,13 @@ t_wh   = color.white
 t_gr   = color.new(color.gray, 20)
 
 if show_table and barstate.islast
-    // Header row
-    table.cell(dash, 0, 0, "SIGNAL",       text_color=t_gr,  text_size=size.small, bgcolor=c_head, text_halign=text.align_left)
-    table.cell(dash, 1, 0, "▲ BULL",       text_color=color.lime, text_size=size.small, bgcolor=c_head)
-    table.cell(dash, 2, 0, "▼ BEAR",       text_color=color.red,  text_size=size.small, bgcolor=c_head)
+    // Row 0 — Header
+    table.cell(dash, 0, 0, "SIGNAL",  text_color=t_gr,       text_size=size.small, bgcolor=c_head, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "▲ BULL",  text_color=color.lime, text_size=size.small, bgcolor=c_head)
+    table.cell(dash, 2, 0, "▼ BEAR",  text_color=color.red,  text_size=size.small, bgcolor=c_head)
 
-    // Row 1 — EMA
-    table.cell(dash, 0, 1, "① EMA",        text_color=t_wh, text_size=size.small, text_halign=text.align_left)
+    // Row 1 — EMA (shows "–" when price is between the two EMAs)
+    table.cell(dash, 0, 1, "① EMA",   text_color=t_wh, text_size=size.small, text_halign=text.align_left)
     table.cell(dash, 1, 1, sig1_bull ? "✓" : "–", text_color=sig1_bull ? t_on : t_off, text_size=size.small, bgcolor=sig1_bull ? c_on : c_off)
     table.cell(dash, 2, 1, sig1_bear ? "✓" : "–", text_color=sig1_bear ? color.red : t_off, text_size=size.small, bgcolor=sig1_bear ? c_bear : c_off)
 
@@ -215,7 +248,7 @@ if show_table and barstate.islast
     table.cell(dash, 2, 2, sig2_bear ? "✓" : "–", text_color=sig2_bear ? color.red : t_off, text_size=size.small, bgcolor=sig2_bear ? c_bear : c_off)
 
     // Row 3 — MACD
-    table.cell(dash, 0, 3, "③ MACD",       text_color=t_wh, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 0, 3, "③ MACD",  text_color=t_wh, text_size=size.small, text_halign=text.align_left)
     table.cell(dash, 1, 3, sig3_bull ? "✓" : "–", text_color=sig3_bull ? t_on : t_off, text_size=size.small, bgcolor=sig3_bull ? c_on : c_off)
     table.cell(dash, 2, 3, sig3_bear ? "✓" : "–", text_color=sig3_bear ? color.red : t_off, text_size=size.small, bgcolor=sig3_bear ? c_bear : c_off)
 
@@ -223,38 +256,55 @@ if show_table and barstate.islast
     bb_bull_txt = sig4_bull ? "✓" : sig4_squeeze ? "SQZ" : "–"
     bb_bull_col = sig4_bull ? t_on : sig4_squeeze ? t_warn : t_off
     bb_bull_bg  = sig4_bull ? c_on : sig4_squeeze ? c_warn : c_off
-    table.cell(dash, 0, 4, "④ BB",         text_color=t_wh, text_size=size.small, text_halign=text.align_left)
-    table.cell(dash, 1, 4, bb_bull_txt,    text_color=bb_bull_col, text_size=size.small, bgcolor=bb_bull_bg)
+    table.cell(dash, 0, 4, "④ BB",    text_color=t_wh, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 4, bb_bull_txt, text_color=bb_bull_col, text_size=size.small, bgcolor=bb_bull_bg)
     table.cell(dash, 2, 4, sig4_bear ? "✓" : "–", text_color=sig4_bear ? color.red : t_off, text_size=size.small, bgcolor=sig4_bear ? c_bear : c_off)
 
-    // Row 5 — Volume
-    vol_txt = sig5_confirm ? "HIGH" : sig5_weak ? "LOW" : "AVG"
-    vol_col = sig5_confirm ? t_on : sig5_weak ? color.red : t_off
-    vol_bg  = sig5_confirm ? c_on : sig5_weak ? c_bear : c_off
-    table.cell(dash, 0, 5, "⑤ VOL",        text_color=t_wh, text_size=size.small, text_halign=text.align_left)
-    table.cell(dash, 1, 5, vol_txt,         text_color=vol_col, text_size=size.small, bgcolor=vol_bg)
-    table.cell(dash, 2, 5, vol_txt,         text_color=vol_col, text_size=size.small, bgcolor=vol_bg)
+    // Row 5 — Volume (directional: ↑ confirms bull candle, ↓ confirms bear candle)
+    vol_bull_txt = sig5_vol_bull ? "↑HIGH" : sig5_weak ? "LOW" : "avg"
+    vol_bear_txt = sig5_vol_bear ? "↓HIGH" : sig5_weak ? "LOW" : "avg"
+    vol_bull_col = sig5_vol_bull ? t_on      : sig5_weak ? color.red : t_off
+    vol_bear_col = sig5_vol_bear ? color.red : sig5_weak ? color.red : t_off
+    vol_bull_bg  = sig5_vol_bull ? c_on      : sig5_weak ? c_bear    : c_off
+    vol_bear_bg  = sig5_vol_bear ? c_bear    : sig5_weak ? c_bear    : c_off
+    table.cell(dash, 0, 5, "⑤ VOL",   text_color=t_wh, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 5, vol_bull_txt, text_color=vol_bull_col, text_size=size.small, bgcolor=vol_bull_bg)
+    table.cell(dash, 2, 5, vol_bear_txt, text_color=vol_bear_col, text_size=size.small, bgcolor=vol_bear_bg)
 
     // Row 6 — HV Rank
-    hv_txt  = hv_low_signal ? "LOW " + str.tostring(math.round(hv_rank)) + "%" : hv_high_signal ? "HIGH " + str.tostring(math.round(hv_rank)) + "%" : str.tostring(math.round(hv_rank)) + "%"
-    hv_bull_col = hv_low_signal ? t_on : t_off
-    hv_sell_col = hv_high_signal ? t_warn : t_off
-    table.cell(dash, 0, 6, "⑥ HV Rank",   text_color=t_wh, text_size=size.small, text_halign=text.align_left)
-    table.cell(dash, 1, 6, hv_low_signal  ? "BUY IV" : "–",  text_color=hv_bull_col, text_size=size.small, bgcolor=hv_low_signal ? c_on : c_off)
-    table.cell(dash, 2, 6, hv_high_signal ? "SELL IV" : "–", text_color=hv_sell_col, text_size=size.small, bgcolor=hv_high_signal ? c_warn : c_off)
+    hv_txt      = hv_low_signal  ? "LOW "  + str.tostring(math.round(hv_rank)) + "%" :
+                  hv_high_signal ? "HIGH " + str.tostring(math.round(hv_rank)) + "%" :
+                                   str.tostring(math.round(hv_rank)) + "%"
+    table.cell(dash, 0, 6, "⑥ HV Rank", text_color=t_wh, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 6, hv_low_signal  ? "BUY IV"  : "–", text_color=hv_low_signal  ? t_on   : t_off, text_size=size.small, bgcolor=hv_low_signal  ? c_on   : c_off)
+    table.cell(dash, 2, 6, hv_high_signal ? "SELL IV" : "–", text_color=hv_high_signal ? t_warn : t_off, text_size=size.small, bgcolor=hv_high_signal ? c_warn : c_off)
 
-    // Score row
-    table.cell(dash, 0, 7, "SCORE",        text_color=t_gr, text_size=size.small, bgcolor=c_head, text_halign=text.align_left)
-    table.cell(dash, 1, 7, str.tostring(bull_score) + " / 5", text_color=bull_score >= min_bull ? color.lime : t_wh, text_size=size.small, bgcolor=c_head)
-    table.cell(dash, 2, 7, str.tostring(bear_score) + " / 5", text_color=bear_score >= min_bear ? color.red  : t_wh, text_size=size.small, bgcolor=c_head)
+    // Row 7 — ADX
+    adx_str = (use_adx ? "" : "(off) ") + str.tostring(math.round(adx_val))
+    adx_col = adx_val >= adx_thresh ? t_on : t_off
+    adx_bg  = adx_val >= adx_thresh ? c_on : c_off
+    table.merge_cells(dash, 1, 7, 2, 7)
+    table.cell(dash, 0, 7, "⑦ ADX",    text_color=t_wh,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 7, adx_str,     text_color=adx_col, text_size=size.small, bgcolor=adx_bg)
 
-    // Strategy row (merged)
-    strat_str = (fire_long_call   ? "▲ LONG CALL / BULL SPREAD"    :
-                 fire_long_put    ? "▼ LONG PUT / BEAR SPREAD"     :
-                 fire_sell_put    ? "$ SELL PUT (cash-secured)"     :
-                 fire_sell_call   ? "$ SELL CALL (covered)"         :
-                 fire_iron_condor ? "◆ IRON CONDOR"                 :
-                 fire_squeeze     ? "⚡ WAIT — SQUEEZE BREAKOUT"    :
+    // Row 8 — ATR (move-size context for strike selection)
+    atr_str = str.tostring(math.round(atr_val, 2)) + "  (" + str.tostring(math.round(atr_pct, 1)) + "%)"
+    table.merge_cells(dash, 1, 8, 2, 8)
+    table.cell(dash, 0, 8, "ATR 14",   text_color=t_wh, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 8, atr_str,    text_color=t_off, text_size=size.small, bgcolor=c_off)
+
+    // Row 9 — Score
+    table.cell(dash, 0, 9, "SCORE",    text_color=t_gr, text_size=size.small, bgcolor=c_head, text_halign=text.align_left)
+    table.cell(dash, 1, 9, str.tostring(bull_score) + " / 5", text_color=bull_score >= min_bull ? color.lime : t_wh, text_size=size.small, bgcolor=c_head)
+    table.cell(dash, 2, 9, str.tostring(bear_score) + " / 5", text_color=bear_score >= min_bear ? color.red  : t_wh, text_size=size.small, bgcolor=c_head)
+
+    // Row 10 — Strategy (merged)
+    strat_str = (fire_long_call   ? "▲ LONG CALL / BULL SPREAD"  :
+                 fire_long_put    ? "▼ LONG PUT / BEAR SPREAD"   :
+                 fire_sell_put    ? "$ SELL PUT (cash-secured)"   :
+                 fire_sell_call   ? "$ SELL CALL (covered)"       :
+                 fire_iron_condor ? "◆ IRON CONDOR"               :
+                 fire_squeeze     ? "⚡ WAIT — SQUEEZE BREAKOUT"  :
                  "⏸  WAIT — mixed signals")
     strat_col = (fire_long_call   ? color.lime   :
                  fire_long_put    ? color.red     :
@@ -263,33 +313,32 @@ if show_table and barstate.islast
                  fire_iron_condor ? color.purple  :
                  fire_squeeze     ? color.yellow  :
                  color.gray)
-    table.merge_cells(dash, 0, 8, 2, 8)
-    table.cell(dash, 0, 8, strat_str, text_color=strat_col, text_size=size.small, bgcolor=c_head)
+    table.merge_cells(dash, 0, 10, 2, 10)
+    table.cell(dash, 0, 10, strat_str, text_color=strat_col, text_size=size.small, bgcolor=c_head)
 
 
 // ─── ALERT CONDITIONS ─────────────────────────────────────────────────────────
-//  After adding this script, go to: Alert → Condition → pick from list below.
-//  Set "Once per bar close" for reliable signals. Enable push notification.
+//  plot_5 = bull_score, plot_6 = bear_score, plot_7 = hv_rank
 
 alertcondition(fire_long_call,
      "▲ Bull Signal — Buy Calls",
-     "5-Signal Scout: BULLISH {{ticker}} — Score {{plot_0}}/5 — Consider long call or bull call spread. HV Rank: {{plot_6}}%")
+     "5-Signal Scout: BULLISH {{ticker}} — Score {{plot_5}}/5 — Consider long call or bull call spread. HV Rank: {{plot_7}}%")
 
 alertcondition(fire_long_put,
      "▼ Bear Signal — Buy Puts",
-     "5-Signal Scout: BEARISH {{ticker}} — Score {{plot_0}}/5 — Consider long put or bear put spread. HV Rank: {{plot_6}}%")
+     "5-Signal Scout: BEARISH {{ticker}} — Score {{plot_6}}/5 — Consider long put or bear put spread. HV Rank: {{plot_7}}%")
 
 alertcondition(fire_sell_put,
      "$ High IV — Sell Cash-Secured Put",
-     "5-Signal Scout: HIGH IV on {{ticker}} + bullish lean — Consider selling put to collect premium. HV Rank: {{plot_6}}%")
+     "5-Signal Scout: HIGH IV on {{ticker}} + bullish lean — Consider selling put to collect premium. HV Rank: {{plot_7}}%")
 
 alertcondition(fire_sell_call,
      "$ High IV — Sell Covered Call",
-     "5-Signal Scout: HIGH IV on {{ticker}} + bearish lean — Consider covered call. HV Rank: {{plot_6}}%")
+     "5-Signal Scout: HIGH IV on {{ticker}} + bearish lean — Consider covered call. HV Rank: {{plot_7}}%")
 
 alertcondition(fire_iron_condor,
      "◆ Iron Condor Setup",
-     "5-Signal Scout: HIGH IV + NEUTRAL on {{ticker}} — Consider iron condor. HV Rank: {{plot_6}}%")
+     "5-Signal Scout: HIGH IV + NEUTRAL on {{ticker}} — Consider iron condor. HV Rank: {{plot_7}}%")
 
 alertcondition(fire_squeeze,
      "⚡ BB Squeeze — Breakout Alert",
