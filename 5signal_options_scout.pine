@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 indicator("5-Signal Options Scout", overlay=true, max_bars_back=500)
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -249,20 +249,20 @@ if show_table and barstate.islast
     table.cell(dash, 2, 7, str.tostring(bear_score) + " / 5", text_color=bear_score >= min_bear ? color.red  : t_wh, text_size=size.small, bgcolor=c_head)
 
     // Strategy row (merged)
-    strat_str = fire_long_call   ? "▲ LONG CALL / BULL SPREAD"    :
-                fire_long_put    ? "▼ LONG PUT / BEAR SPREAD"     :
-                fire_sell_put    ? "$ SELL PUT (cash-secured)"     :
-                fire_sell_call   ? "$ SELL CALL (covered)"         :
-                fire_iron_condor ? "◆ IRON CONDOR"                 :
-                fire_squeeze     ? "⚡ WAIT — SQUEEZE BREAKOUT"    :
-                "⏸  WAIT — mixed signals"
-    strat_col = fire_long_call   ? color.lime   :
-                fire_long_put    ? color.red     :
-                fire_sell_put    ? color.orange  :
-                fire_sell_call   ? color.orange  :
-                fire_iron_condor ? color.purple  :
-                fire_squeeze     ? color.yellow  :
-                color.gray
+    strat_str = (fire_long_call   ? "▲ LONG CALL / BULL SPREAD"    :
+                 fire_long_put    ? "▼ LONG PUT / BEAR SPREAD"     :
+                 fire_sell_put    ? "$ SELL PUT (cash-secured)"     :
+                 fire_sell_call   ? "$ SELL CALL (covered)"         :
+                 fire_iron_condor ? "◆ IRON CONDOR"                 :
+                 fire_squeeze     ? "⚡ WAIT — SQUEEZE BREAKOUT"    :
+                 "⏸  WAIT — mixed signals")
+    strat_col = (fire_long_call   ? color.lime   :
+                 fire_long_put    ? color.red     :
+                 fire_sell_put    ? color.orange  :
+                 fire_sell_call   ? color.orange  :
+                 fire_iron_condor ? color.purple  :
+                 fire_squeeze     ? color.yellow  :
+                 color.gray)
     table.merge_cells(dash, 0, 8, 2, 8)
     table.cell(dash, 0, 8, strat_str, text_color=strat_col, text_size=size.small, bgcolor=c_head)
 
